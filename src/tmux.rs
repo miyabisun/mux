@@ -1,8 +1,24 @@
-use std::{env, ffi::OsString, process::Command};
+use std::{collections::HashSet, env, ffi::OsString, path::Path, process::Command};
 
 use anyhow::{Context, Result, bail};
 
-use crate::project::{Project, Window};
+use crate::{
+    lint::is_allowed_command,
+    project::{Project, ProjectDocument, Window, validate_project_name},
+};
+
+pub(crate) struct Snapshot {
+    pub(crate) document: ProjectDocument,
+    pub(crate) warnings: Vec<String>,
+}
+
+pub(crate) fn snapshot() -> Result<Snapshot> {
+    let pane = env::var("TMUX_PANE").context("mux snapshot must be run inside tmux")?;
+    if pane.is_empty() {
+        bail!("mux snapshot must be run inside tmux");
+    }
+    Tmux::default().snapshot(&pane)
+}
 
 pub(crate) fn open(project: &Project) -> Result<()> {
     let client = Tmux::default();
@@ -44,6 +60,133 @@ struct Tmux {
 }
 
 impl Tmux {
+    fn snapshot(&self, pane_target: &str) -> Result<Snapshot> {
+        let session_id = self.display_value(pane_target, "#{session_id}")?;
+        let raw_session_name = self.display_value(&session_id, "#{session_name}")?;
+        let project_name = normalize_project_name(&raw_session_name)?;
+        let mut warnings = Vec::new();
+        if project_name != raw_session_name {
+            warnings.push(format!(
+                "session name {raw_session_name:?} was normalized to {project_name:?}"
+            ));
+        }
+
+        let window_ids = self.identifier_list([
+            OsString::from("list-windows"),
+            OsString::from("-t"),
+            OsString::from(&session_id),
+            OsString::from("-F"),
+            OsString::from("#{window_id}"),
+        ])?;
+        let active_window_id = self.display_value(&session_id, "#{window_id}")?;
+        let default_shell = self.display_value(&session_id, "#{default-shell}")?;
+        let default_shell = Path::new(&default_shell)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+
+        let mut used_window_names = HashSet::new();
+        let mut project_root = None;
+        let mut windows = Vec::with_capacity(window_ids.len());
+        let mut startup_window = None;
+        let mut startup_pane = None;
+
+        for window_id in window_ids {
+            let window = self.snapshot_window(
+                &window_id,
+                default_shell,
+                &mut used_window_names,
+                &mut project_root,
+                &mut warnings,
+            )?;
+
+            if window_id == active_window_id {
+                startup_window = Some(window.name.clone());
+                startup_pane = window.focused_pane;
+            }
+            windows.push(window);
+        }
+
+        let root = project_root.context("tmux session has no windows")?;
+        let startup_window = startup_window.context("tmux session has no active window")?;
+        let document = ProjectDocument::from_project(Project {
+            name: project_name,
+            root,
+            startup_window: Some(startup_window),
+            startup_pane,
+            windows,
+        })?;
+        Ok(Snapshot { document, warnings })
+    }
+
+    fn snapshot_window(
+        &self,
+        window_id: &str,
+        default_shell: &str,
+        used_window_names: &mut HashSet<String>,
+        project_root: &mut Option<String>,
+        warnings: &mut Vec<String>,
+    ) -> Result<Window> {
+        let raw_name = self.display_value(window_id, "#{window_name}")?;
+        let name = unique_window_name(&raw_name, used_window_names);
+        if name != raw_name {
+            warnings.push(format!(
+                "window name {raw_name:?} was changed to {name:?} to keep names unique"
+            ));
+        }
+        let layout = self.display_value(window_id, "#{window_layout}")?;
+        let pane_ids = self.identifier_list([
+            OsString::from("list-panes"),
+            OsString::from("-t"),
+            OsString::from(window_id),
+            OsString::from("-F"),
+            OsString::from("#{pane_id}"),
+        ])?;
+        let active_pane_id = self.display_value(window_id, "#{pane_id}")?;
+        let focused_pane = pane_ids
+            .iter()
+            .position(|pane_id| pane_id == &active_pane_id)
+            .map(|position| position + 1)
+            .with_context(|| format!("active pane is missing from window '{raw_name}'"))?;
+
+        let mut paths = Vec::with_capacity(pane_ids.len());
+        let mut commands = Vec::with_capacity(pane_ids.len());
+        for pane_id in &pane_ids {
+            paths.push(self.display_value(pane_id, "#{pane_current_path}")?);
+            commands.push(self.display_value(pane_id, "#{pane_current_command}")?);
+        }
+        let window_root = paths
+            .first()
+            .filter(|path| !path.is_empty())
+            .cloned()
+            .with_context(|| format!("window '{raw_name}' has no usable pane path"))?;
+        let root = project_root.get_or_insert_with(|| window_root.clone());
+        let panes = paths
+            .iter()
+            .zip(commands.iter())
+            .enumerate()
+            .map(|(position, (path, command))| {
+                snapshot_pane_command(
+                    &name,
+                    position + 1,
+                    path,
+                    &window_root,
+                    command,
+                    default_shell,
+                    warnings,
+                )
+            })
+            .collect();
+
+        Ok(Window {
+            name,
+            layout: Some(layout),
+            root: (window_root != *root).then_some(window_root),
+            focused_pane: Some(focused_pane),
+            panes,
+        })
+    }
+
     fn has_session(&self, name: &str) -> Result<bool> {
         let output = self
             .command()
@@ -271,6 +414,51 @@ impl Tmux {
         Ok(value.to_owned())
     }
 
+    fn identifier_list<I>(&self, arguments: I) -> Result<Vec<String>>
+    where
+        I: IntoIterator<Item = OsString>,
+    {
+        let output = self
+            .command()
+            .args(arguments)
+            .output()
+            .context("cannot run tmux; install tmux before taking a snapshot")?;
+        if !output.status.success() {
+            bail!(
+                "tmux failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let text = String::from_utf8(output.stdout).context("tmux returned non-UTF-8 output")?;
+        let values: Vec<_> = text.lines().map(str::to_owned).collect();
+        if values.is_empty() || values.iter().any(String::is_empty) {
+            bail!("tmux returned an unexpected identifier list");
+        }
+        Ok(values)
+    }
+
+    fn display_value(&self, target: &str, format: &str) -> Result<String> {
+        let output = self
+            .command()
+            .args(["display-message", "-p", "-t", target, format])
+            .output()
+            .context("cannot run tmux; install tmux before taking a snapshot")?;
+        if !output.status.success() {
+            bail!(
+                "tmux failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let mut bytes = output.stdout;
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+        }
+        String::from_utf8(bytes).context("tmux returned non-UTF-8 output")
+    }
+
     fn command(&self) -> Command {
         let mut command = Command::new("tmux");
         command.args(&self.leading_args);
@@ -279,6 +467,75 @@ impl Tmux {
         }
         command
     }
+}
+
+fn normalize_project_name(name: &str) -> Result<String> {
+    let mut normalized = String::new();
+    let mut replacing = false;
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+            normalized.push(character);
+            replacing = false;
+        } else if !replacing {
+            normalized.push('-');
+            replacing = true;
+        }
+    }
+    if !normalized.bytes().any(|byte| byte.is_ascii_alphanumeric()) {
+        bail!(
+            "tmux session name {name:?} cannot be converted to a meaningful mux project name; rename the session"
+        );
+    }
+    validate_project_name(&normalized)?;
+    Ok(normalized)
+}
+
+fn unique_window_name(name: &str, used: &mut HashSet<String>) -> String {
+    let base = if name.is_empty() { "window" } else { name };
+    if used.insert(base.to_owned()) {
+        return base.to_owned();
+    }
+    for suffix in 2_usize.. {
+        let candidate = format!("{base}-{suffix}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!("an unused window suffix always exists")
+}
+
+fn is_shell_command(command: &str, default_shell: &str) -> bool {
+    command == default_shell
+        || matches!(
+            command,
+            "sh" | "bash" | "dash" | "zsh" | "fish" | "ksh" | "csh" | "tcsh" | "nu"
+        )
+}
+
+fn snapshot_pane_command(
+    window_name: &str,
+    position: usize,
+    path: &str,
+    window_root: &str,
+    command: &str,
+    default_shell: &str,
+    warnings: &mut Vec<String>,
+) -> String {
+    if path != window_root {
+        warnings.push(format!(
+            "window {window_name:?} pane {position} cwd differs from its window root; its command was omitted"
+        ));
+        return String::new();
+    }
+    if is_allowed_command(command) {
+        return command.to_owned();
+    }
+    if !command.is_empty() && !is_shell_command(command, default_shell) {
+        warnings.push(format!(
+            "window {window_name:?} pane {position} command {command:?} was omitted"
+        ));
+    }
+    String::new()
 }
 
 #[derive(Debug)]
@@ -298,6 +555,31 @@ mod tests {
     fn client_mode_depends_only_on_tmux_environment() {
         assert_eq!(client_action(false), ClientAction::Attach);
         assert_eq!(client_action(true), ClientAction::Switch);
+    }
+
+    #[test]
+    fn snapshot_names_are_safe_and_deterministic() {
+        assert_eq!(
+            normalize_project_name("my session.1").unwrap(),
+            "my-session-1"
+        );
+        assert!(normalize_project_name("日本語___").is_err());
+
+        let mut used = HashSet::new();
+        assert_eq!(unique_window_name("shell", &mut used), "shell");
+        assert_eq!(unique_window_name("shell", &mut used), "shell-2");
+        assert_eq!(unique_window_name("shell-2", &mut used), "shell-2-2");
+        assert_eq!(unique_window_name("", &mut used), "window");
+    }
+
+    #[test]
+    fn snapshot_only_keeps_allowlisted_non_shell_commands() {
+        assert!(is_allowed_command("claude"));
+        assert!(is_allowed_command("codex"));
+        assert!(!is_allowed_command("node"));
+        assert!(is_shell_command("zsh", "zsh"));
+        assert!(is_shell_command("bash", "zsh"));
+        assert!(!is_shell_command("node", "zsh"));
     }
 
     #[test]

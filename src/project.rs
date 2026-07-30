@@ -1,38 +1,57 @@
 use std::collections::HashSet;
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
 pub(crate) struct ProjectDocument {
     pub(crate) project: Project,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Project {
     pub(crate) name: String,
     pub(crate) root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) startup_window: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) startup_pane: Option<usize>,
     pub(crate) windows: Vec<Window>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Window {
     pub(crate) name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) layout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) focused_pane: Option<usize>,
     pub(crate) panes: Vec<String>,
 }
 
 impl ProjectDocument {
+    pub(crate) fn from_project(project: Project) -> Result<Self> {
+        validate(&project)?;
+        Ok(Self { project })
+    }
+
     pub(crate) fn parse(source: &str) -> Result<Self> {
         let project: Project = toml::from_str(source).context("project TOML is invalid")?;
         validate(&project)?;
         Ok(Self { project })
+    }
+
+    pub(crate) fn to_toml(&self) -> Result<String> {
+        let mut source = toml::to_string_pretty(&self.project)
+            .context("cannot serialize project snapshot as TOML")?;
+        if !source.ends_with('\n') {
+            source.push('\n');
+        }
+        Ok(source)
     }
 }
 

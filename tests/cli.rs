@@ -35,6 +35,61 @@ fn project_toml(root: &Path, name: &str) -> String {
     )
 }
 
+fn install_snapshot_tmux(bin: &Path) {
+    fs::create_dir(bin).unwrap();
+    let tmux = bin.join("tmux");
+    fs::write(
+        &tmux,
+        r#"#!/bin/sh
+if [ "${MUX_TEST_FAIL:-}" = 1 ] && [ "$*" = 'display-message -p -t @2 #{window_layout}' ]; then
+  printf '%s\n' 'injected tmux failure' >&2
+  exit 1
+fi
+case "$*" in
+'display-message -p -t %7 #{session_id}') printf '%s\n' '$1' ;;
+'display-message -p -t $1 #{session_name}') printf '%s\n' 'demo session.1' ;;
+'list-windows -t $1 -F #{window_id}') printf '%s\n' '@1' '@2' ;;
+'display-message -p -t $1 #{window_id}') printf '%s\n' '@2' ;;
+'display-message -p -t $1 #{default-shell}') printf '%s\n' '/bin/zsh' ;;
+'display-message -p -t @1 #{window_name}') printf '%s\n' 'work' ;;
+'display-message -p -t @2 #{window_name}') printf '%s\n' 'work' ;;
+'display-message -p -t @1 #{window_layout}'|'display-message -p -t @2 #{window_layout}') printf '%s\n' '020a,80x24,0,0{40x24,0,0,1,39x24,41,0,2}' ;;
+'list-panes -t @1 -F #{pane_id}') printf '%s\n' '%7' '%8' ;;
+'list-panes -t @2 -F #{pane_id}') printf '%s\n' '%9' '%10' ;;
+'display-message -p -t @1 #{pane_id}') printf '%s\n' '%8' ;;
+'display-message -p -t @2 #{pane_id}') printf '%s\n' '%9' ;;
+'display-message -p -t %7 #{pane_current_path}'|'display-message -p -t %8 #{pane_current_path}') printf '%s\n' "$MUX_TEST_ROOT" ;;
+'display-message -p -t %9 #{pane_current_path}') printf '%s\n' "$MUX_TEST_OTHER" ;;
+'display-message -p -t %10 #{pane_current_path}') printf '%s\n' "$MUX_TEST_DIFFERENT" ;;
+'display-message -p -t %7 #{pane_current_command}') printf '%s\n' 'zsh' ;;
+'display-message -p -t %8 #{pane_current_command}') printf '%s\n' 'claude' ;;
+'display-message -p -t %9 #{pane_current_command}') printf '%s\n' 'node' ;;
+'display-message -p -t %10 #{pane_current_command}') printf '%s\n' 'nvim' ;;
+*) printf 'unexpected tmux arguments: %s\n' "$*" >&2; exit 1 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn fake_snapshot(bin: &Path, config: &Path, roots: [&Path; 3], fail: bool) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mux"));
+    command
+        .arg("snapshot")
+        .env("MUX_CONFIG", config)
+        .env("PATH", bin)
+        .env("TMUX", "test-socket,1,0")
+        .env("TMUX_PANE", "%7")
+        .env("MUX_TEST_ROOT", roots[0])
+        .env("MUX_TEST_OTHER", roots[1])
+        .env("MUX_TEST_DIFFERENT", roots[2]);
+    if fail {
+        command.env("MUX_TEST_FAIL", "1");
+    }
+    command.output().unwrap()
+}
+
 #[test]
 fn save_check_list_lint_and_remove_round_trip() {
     let temp = tempfile::tempdir().unwrap();
@@ -131,6 +186,94 @@ fn missing_projects_and_empty_config_have_distinct_contracts() {
     let select = mux(&config, &[], None);
     assert!(!select.status.success());
     assert!(String::from_utf8_lossy(&select.stderr).contains("no projects found"));
+}
+
+#[test]
+fn snapshot_requires_a_current_tmux_pane_without_writing_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("config");
+    let output = Command::new(env!("CARGO_BIN_EXE_mux"))
+        .arg("snapshot")
+        .env("MUX_CONFIG", &config)
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("inside tmux"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!config.exists());
+}
+
+#[test]
+fn snapshot_outputs_valid_composable_toml_and_reports_loss_as_warnings() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let other = temp.path().join("other");
+    let different = temp.path().join("different");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&other).unwrap();
+    fs::create_dir(&different).unwrap();
+    let bin = temp.path().join("bin");
+    install_snapshot_tmux(&bin);
+    let config = temp.path().join("config");
+    let roots = [root.as_path(), other.as_path(), different.as_path()];
+    let snapshot = fake_snapshot(&bin, &config, roots, false);
+
+    assert!(
+        snapshot.status.success(),
+        "{}",
+        String::from_utf8_lossy(&snapshot.stderr)
+    );
+    assert!(!config.exists());
+    let source = String::from_utf8(snapshot.stdout).unwrap();
+    let project: toml::Value = toml::from_str(&source).unwrap();
+    assert_eq!(project["name"].as_str(), Some("demo-session-1"));
+    assert_eq!(
+        project["root"].as_str(),
+        Some(root.to_string_lossy().as_ref())
+    );
+    assert_eq!(project["startup_window"].as_str(), Some("work-2"));
+    assert_eq!(project["startup_pane"].as_integer(), Some(1));
+    let windows = project["windows"].as_array().unwrap();
+    assert_eq!(windows[0]["name"].as_str(), Some("work"));
+    assert_eq!(windows[0]["focused_pane"].as_integer(), Some(2));
+    assert_eq!(windows[0]["panes"][0].as_str(), Some(""));
+    assert_eq!(windows[0]["panes"][1].as_str(), Some("claude"));
+    assert!(windows[0].get("root").is_none());
+    assert_eq!(windows[1]["name"].as_str(), Some("work-2"));
+    assert_eq!(
+        windows[1]["root"].as_str(),
+        Some(other.to_string_lossy().as_ref())
+    );
+    assert_eq!(windows[1]["panes"][0].as_str(), Some(""));
+    assert_eq!(windows[1]["panes"][1].as_str(), Some(""));
+    let warnings = String::from_utf8(snapshot.stderr).unwrap();
+    assert!(warnings.contains("normalized"), "{warnings}");
+    assert!(warnings.contains("keep names unique"), "{warnings}");
+    assert!(
+        warnings.contains("command \"node\" was omitted"),
+        "{warnings}"
+    );
+    assert!(warnings.contains("cwd differs"), "{warnings}");
+
+    let saved = mux(&config, &["save", "captured"], Some(&source));
+    assert!(
+        saved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&saved.stderr)
+    );
+    assert!(mux(&config, &["check", "captured"], None).status.success());
+
+    let failed = fake_snapshot(&bin, &config, roots, true);
+    assert!(!failed.status.success());
+    assert!(failed.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("injected tmux failure"));
 }
 
 #[test]

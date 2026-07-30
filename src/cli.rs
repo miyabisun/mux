@@ -15,6 +15,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Print a TOML project for the current tmux session.
+    Snapshot,
     /// Save a TOML project from standard input.
     Save {
         name: String,

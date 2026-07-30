@@ -7,7 +7,7 @@ mod update;
 
 use std::{
     fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     process::ExitCode,
 };
 
@@ -34,6 +34,7 @@ pub fn run() -> Result<ExitCode> {
 fn run_cli(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Some(Command::Update) => update::run(),
+        Some(Command::Snapshot) => snapshot(),
         command => {
             let config = ConfigDir::discover()?;
             match command {
@@ -43,10 +44,23 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
                 Some(Command::Ls) => list(&config),
                 Some(Command::Check { name }) => check(&config, &name),
                 Some(Command::Lint { name }) => lint(&config, name.as_deref()),
-                Some(Command::Update) => unreachable!("handled above"),
+                Some(Command::Snapshot | Command::Update) => unreachable!("handled above"),
             }
         }
     }
+}
+
+fn snapshot() -> Result<ExitCode> {
+    let snapshot = tmux::snapshot()?;
+    let source = snapshot.document.to_toml()?;
+    ProjectDocument::parse(&source).context("generated snapshot TOML is invalid")?;
+    for warning in snapshot.warnings {
+        eprintln!("warning: {warning}");
+    }
+    io::stdout()
+        .write_all(source.as_bytes())
+        .context("cannot write snapshot TOML")?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn select_and_open(config: &ConfigDir) -> Result<ExitCode> {

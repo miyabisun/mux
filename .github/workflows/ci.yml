@@ -40,3 +40,4 @@ jobs:
         run: |
           cargo test --locked tmux::tests::real_tmux_session_is_built_without_user_configuration -- --ignored
           cargo test --locked --test tmux_attach -- --ignored
+          cargo test --locked --test snapshot_tmux -- --ignored

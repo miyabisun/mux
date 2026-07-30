@@ -4,6 +4,10 @@ use crate::project::ProjectDocument;
 
 const ALLOWED_COMMANDS: [&str; 4] = ["claude", "codex", "cursor-agent", "nvim"];
 
+pub(crate) fn is_allowed_command(command: &str) -> bool {
+    ALLOWED_COMMANDS.contains(&command)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Warning {
     message: String,
@@ -59,7 +63,7 @@ fn lint_command(window: &str, pane: usize, command: &str, warnings: &mut Vec<War
     }
     let words: Vec<_> = command.split_whitespace().collect();
     let executable = words.first().copied().unwrap_or_default();
-    if !ALLOWED_COMMANDS.contains(&executable) {
+    if !is_allowed_command(executable) {
         warnings.push(warning(format!(
             "window '{window}' pane {pane} command '{executable}' is not allowlisted"
         )));
