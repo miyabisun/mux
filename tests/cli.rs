@@ -73,6 +73,41 @@ esac
     fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+fn install_launcher_commands(bin: &Path) {
+    fs::create_dir(bin).unwrap();
+    let fzf = bin.join("fzf");
+    fs::write(
+        &fzf,
+        "#!/bin/sh\nwhile IFS= read -r _line; do :; done\nprintf 'demo\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fzf, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let tmux = bin.join("tmux");
+    fs::write(
+        &tmux,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$MUX_TEST_LOG"
+case "$1" in
+  has-session) exit 1 ;;
+  new-session) printf '%s\n' '$1' ;;
+  list-windows) printf '%s\n' '@1' ;;
+  new-window) printf '%s\n' '@2' ;;
+  list-panes)
+    case "$*" in
+      *' -t @1 '*) printf '%s\n' '%1' ;;
+      *) printf '%s\n' '%3' ;;
+    esac
+    ;;
+  split-window) printf '%s\n' '%2' ;;
+esac
+exit 0
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 fn fake_snapshot(bin: &Path, config: &Path, roots: [&Path; 3], fail: bool) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mux"));
     command
@@ -214,7 +249,7 @@ fn snapshot_requires_a_current_tmux_pane_without_writing_config() {
 fn snapshot_outputs_valid_composable_toml_and_reports_loss_as_warnings() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("root");
-    let other = temp.path().join("other");
+    let other = root.join("other");
     let different = temp.path().join("different");
     fs::create_dir(&root).unwrap();
     fs::create_dir(&other).unwrap();
@@ -247,10 +282,7 @@ fn snapshot_outputs_valid_composable_toml_and_reports_loss_as_warnings() {
     assert_eq!(windows[0]["panes"][1].as_str(), Some("claude"));
     assert!(windows[0].get("root").is_none());
     assert_eq!(windows[1]["name"].as_str(), Some("work-2"));
-    assert_eq!(
-        windows[1]["root"].as_str(),
-        Some(other.to_string_lossy().as_ref())
-    );
+    assert_eq!(windows[1]["root"].as_str(), Some("other"));
     assert_eq!(windows[1]["panes"][0].as_str(), Some(""));
     assert_eq!(windows[1]["panes"][1].as_str(), Some(""));
     let warnings = String::from_utf8(snapshot.stderr).unwrap();
@@ -274,6 +306,104 @@ fn snapshot_outputs_valid_composable_toml_and_reports_loss_as_warnings() {
     assert!(!failed.status.success());
     assert!(failed.stdout.is_empty());
     assert!(String::from_utf8_lossy(&failed.stderr).contains("injected tmux failure"));
+}
+
+#[test]
+fn launcher_overrides_name_and_root_without_rewriting_the_template() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("config");
+    let original = temp.path().join("original");
+    let replacement = temp.path().join("replacement");
+    fs::create_dir_all(original.join("nested")).unwrap();
+    fs::create_dir_all(replacement.join("nested")).unwrap();
+    fs::create_dir(&config).unwrap();
+    let source = format!(
+        "name = \"demo\"\nroot = \"{}\"\n[[windows]]\nname = \"main\"\npanes = [\"\", \"\"]\n[[windows]]\nname = \"nested\"\nroot = \"nested\"\npanes = [\"\", \"\"]\n",
+        original.display()
+    );
+    let project_path = config.join("demo.toml");
+    fs::write(&project_path, &source).unwrap();
+
+    let bin = temp.path().join("bin");
+    install_launcher_commands(&bin);
+    let log = temp.path().join("tmux.log");
+    let output = Command::new(env!("CARGO_BIN_EXE_mux"))
+        .args(["-t", "runtime", "-c", "replacement"])
+        .current_dir(temp.path())
+        .env("MUX_CONFIG", &config)
+        .env("MUX_TEST_LOG", &log)
+        .env("PATH", &bin)
+        .env_remove("TMUX")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let replacement = replacement.canonicalize().unwrap();
+    let calls = fs::read_to_string(&log).unwrap();
+    assert!(calls.contains("has-session -t =runtime"), "{calls}");
+    assert!(
+        calls.contains(&format!(
+            "new-session -d -P -F #{{session_id}} -s runtime -n main -c {}",
+            replacement.display()
+        )),
+        "{calls}"
+    );
+    assert!(
+        calls.contains(&format!(
+            "new-window -d -P -F #{{window_id}} -t $1 -n nested -c {}/nested",
+            replacement.display()
+        )),
+        "{calls}"
+    );
+    let cwd_arguments: Vec<_> = calls
+        .lines()
+        .filter_map(|line| line.rsplit_once(" -c ").map(|(_, root)| root))
+        .collect();
+    assert_eq!(
+        cwd_arguments
+            .iter()
+            .filter(|root| **root == replacement.to_string_lossy())
+            .count(),
+        2,
+        "{calls}"
+    );
+    assert_eq!(
+        cwd_arguments
+            .iter()
+            .filter(|root| **root == format!("{}/nested", replacement.display()))
+            .count(),
+        2,
+        "{calls}"
+    );
+    assert!(calls.contains("attach-session -t =runtime"), "{calls}");
+    assert_eq!(fs::read_to_string(project_path).unwrap(), source);
+}
+
+#[test]
+fn launcher_rejects_invalid_overrides_before_contacting_tmux() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("config");
+    fs::create_dir(&config).unwrap();
+    fs::write(config.join("demo.toml"), project_toml(temp.path(), "demo")).unwrap();
+    let bin = temp.path().join("bin");
+    install_launcher_commands(&bin);
+    fs::remove_file(bin.join("tmux")).unwrap();
+
+    for arguments in [vec!["-t", "invalid/name"], vec!["-c", "definitely-missing"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_mux"))
+            .args(arguments)
+            .current_dir(temp.path())
+            .env("MUX_CONFIG", &config)
+            .env("PATH", &bin)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("cannot run tmux"));
+    }
 }
 
 #[test]

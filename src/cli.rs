@@ -1,5 +1,6 @@
 use std::{
     io::Write,
+    path::PathBuf,
     process::{Command as ProcessCommand, Stdio},
 };
 
@@ -7,8 +8,18 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Select, validate, and launch tmux projects")]
+#[command(
+    version,
+    about = "Select, validate, and launch tmux projects",
+    args_conflicts_with_subcommands = true
+)]
 pub struct Cli {
+    /// Override the selected project's tmux session name.
+    #[arg(short = 't', long = "target", value_name = "NAME")]
+    pub target: Option<String>,
+    /// Override the selected project's top-level working directory.
+    #[arg(short = 'c', long = "cwd", value_name = "DIR")]
+    pub cwd: Option<PathBuf>,
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -62,4 +73,30 @@ pub fn select_with_fzf(names: &[String]) -> Result<Option<String>> {
         bail!("fzf returned an unknown project");
     }
     Ok(Some(selected.to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    #[test]
+    fn launcher_overrides_accept_short_and_long_forms() {
+        let short = Cli::try_parse_from(["mux", "-t", "work", "-c", "/tmp"]).unwrap();
+        assert_eq!(short.target.as_deref(), Some("work"));
+        assert_eq!(short.cwd.as_deref(), Some(Path::new("/tmp")));
+
+        let long = Cli::try_parse_from(["mux", "--target", "work", "--cwd", "/tmp"]).unwrap();
+        assert_eq!(long.target.as_deref(), Some("work"));
+        assert_eq!(long.cwd.as_deref(), Some(Path::new("/tmp")));
+    }
+
+    #[test]
+    fn launcher_overrides_conflict_with_subcommands_in_both_orders() {
+        assert!(Cli::try_parse_from(["mux", "-t", "work", "check", "demo"]).is_err());
+        assert!(Cli::try_parse_from(["mux", "check", "demo", "-t", "work"]).is_err());
+        assert!(Cli::try_parse_from(["mux", "-c", "/tmp", "ls"]).is_err());
+        assert!(Cli::try_parse_from(["mux", "ls", "-c", "/tmp"]).is_err());
+    }
 }

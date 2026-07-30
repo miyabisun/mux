@@ -1,4 +1,8 @@
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Component, Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -55,6 +59,62 @@ impl ProjectDocument {
     }
 }
 
+impl Project {
+    pub(crate) fn apply_launch_overrides(
+        &mut self,
+        target: Option<&str>,
+        cwd: Option<&Path>,
+    ) -> Result<()> {
+        if let Some(target) = target {
+            validate_project_name(target).context("invalid target name")?;
+            target.clone_into(&mut self.name);
+        }
+
+        let root = if let Some(cwd) = cwd {
+            let root = fs::canonicalize(cwd)
+                .with_context(|| format!("cwd '{}' is not an existing directory", cwd.display()))?;
+            if !root.is_dir() {
+                bail!("cwd '{}' is not an existing directory", cwd.display());
+            }
+            root
+        } else {
+            let root = Path::new(&self.root);
+            if root.is_absolute() {
+                return Ok(());
+            }
+            self.resolved_root()?
+        };
+        root.to_str()
+            .context("effective project root is not valid UTF-8")?
+            .clone_into(&mut self.root);
+        Ok(())
+    }
+
+    pub(crate) fn resolved_root(&self) -> Result<PathBuf> {
+        let root = Path::new(&self.root);
+        if root.is_absolute() {
+            Ok(root.to_path_buf())
+        } else {
+            Ok(std::env::current_dir()
+                .context("cannot determine the current directory")?
+                .join(root))
+        }
+    }
+
+    pub(crate) fn resolved_window_root(&self, window: &Window) -> Result<PathBuf> {
+        let root = self.resolved_root()?;
+        Ok(resolve_window_root(&root, window.root.as_deref()))
+    }
+}
+
+pub(crate) fn resolve_window_root(project_root: &Path, window_root: Option<&str>) -> PathBuf {
+    match window_root.map(Path::new) {
+        None => project_root.to_path_buf(),
+        Some(root) if root.is_absolute() => root.to_path_buf(),
+        Some(root) => project_root.join(root),
+    }
+}
+
 pub(crate) fn validate_project_name(name: &str) -> Result<()> {
     if name.is_empty()
         || !name
@@ -89,6 +149,12 @@ fn validate(project: &Project) -> Result<()> {
         }
         if window.root.as_deref() == Some("") {
             bail!("window '{name}' root must not be empty");
+        }
+        if window.root.as_deref().is_some_and(|root| {
+            let root = Path::new(root);
+            !root.is_absolute() && root.components().any(|part| part == Component::ParentDir)
+        }) {
+            bail!("window '{name}' relative root must not contain '..'");
         }
         if let Some(pane) = window.focused_pane {
             validate_pane_reference(name, "focused_pane", pane, window.panes.len())?;
@@ -280,5 +346,59 @@ panes = ["claude", ""]
         for valid in ["a", "my-project", "my_project", "A1"] {
             validate_project_name(valid).unwrap();
         }
+    }
+
+    #[test]
+    fn relative_window_roots_cannot_escape_the_project_root() {
+        for root in ["..", "../other", "src/../../other"] {
+            let source = VALID.replace(
+                "focused_pane = 1",
+                &format!("root = \"{root}\"\nfocused_pane = 1"),
+            );
+            assert!(ProjectDocument::parse(&source).is_err(), "{root}");
+        }
+        let source = VALID.replace("focused_pane = 1", "root = \"src/./api\"\nfocused_pane = 1");
+        ProjectDocument::parse(&source).unwrap();
+    }
+
+    #[test]
+    fn window_roots_resolve_against_the_project_root() {
+        let top = Path::new("/workspace/project");
+        assert_eq!(resolve_window_root(top, None), top);
+        assert_eq!(
+            resolve_window_root(top, Some("src/api")),
+            Path::new("/workspace/project/src/api")
+        );
+        assert_eq!(
+            resolve_window_root(top, Some("/shared/api")),
+            Path::new("/shared/api")
+        );
+    }
+
+    #[test]
+    fn launch_overrides_can_be_applied_independently() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let replacement = temp.path().join("replacement");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        let source = VALID.replace("root = \"/tmp\"", &format!("root = \"{}\"", root.display()));
+
+        let mut target_only = ProjectDocument::parse(&source).unwrap().project;
+        target_only
+            .apply_launch_overrides(Some("runtime"), None)
+            .unwrap();
+        assert_eq!(target_only.name, "runtime");
+        assert_eq!(target_only.root, root.to_string_lossy());
+
+        let mut cwd_only = ProjectDocument::parse(&source).unwrap().project;
+        cwd_only
+            .apply_launch_overrides(None, Some(&replacement))
+            .unwrap();
+        assert_eq!(cwd_only.name, "settings");
+        assert_eq!(
+            cwd_only.root,
+            replacement.canonicalize().unwrap().to_string_lossy()
+        );
     }
 }

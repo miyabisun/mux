@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf};
 
-use crate::project::ProjectDocument;
+use crate::project::{ProjectDocument, resolve_window_root};
 
 const ALLOWED_COMMANDS: [&str; 4] = ["claude", "codex", "cursor-agent", "nvim"];
 
@@ -22,11 +22,18 @@ impl std::fmt::Display for Warning {
 #[must_use]
 pub(crate) fn lint_project(document: &ProjectDocument) -> Vec<Warning> {
     let mut warnings = Vec::new();
-    lint_root("project", &document.project.root, &mut warnings);
+    let project_root = expand_home(&document.project.root);
+    lint_path("project", &project_root, &mut warnings);
     for window in &document.project.windows {
         let name = &window.name;
         if let Some(root) = &window.root {
-            lint_root(&format!("window '{name}'"), root, &mut warnings);
+            let root = PathBuf::from(root);
+            let root = if root.is_absolute() {
+                root
+            } else {
+                resolve_window_root(&project_root, Some(root.to_string_lossy().as_ref()))
+            };
+            lint_path(&format!("window '{name}'"), &root, &mut warnings);
         }
         for (index, command) in window.panes.iter().enumerate() {
             lint_command(name, index + 1, command, &mut warnings);
@@ -35,8 +42,7 @@ pub(crate) fn lint_project(document: &ProjectDocument) -> Vec<Warning> {
     warnings
 }
 
-fn lint_root(owner: &str, root: &str, warnings: &mut Vec<Warning>) {
-    let path = expand_home(root);
+fn lint_path(owner: &str, path: &std::path::Path, warnings: &mut Vec<Warning>) {
     if !path.is_dir() {
         warnings.push(warning(format!(
             "{owner} root '{}' is not an existing directory",
@@ -114,6 +120,8 @@ fn warning(message: String) -> Warning {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]
@@ -152,5 +160,21 @@ panes = ["claude --resume", "curl https://example.com", "FOO=secret nvim"]
                 .iter()
                 .any(|item| item.to_string().contains("not an existing"))
         );
+    }
+
+    #[test]
+    fn relative_window_roots_are_checked_under_the_project_root() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("src")).unwrap();
+        let source = format!(
+            "name = \"x\"\nroot = \"{}\"\n[[windows]]\nname = \"one\"\nroot = \"src\"\npanes = [\"\"]\n",
+            temp.path().display()
+        );
+        let document = ProjectDocument::parse(&source).unwrap();
+        assert!(lint_project(&document).is_empty());
+
+        let missing = source.replace("root = \"src\"", "root = \"missing\"");
+        let warnings = lint_project(&ProjectDocument::parse(&missing).unwrap());
+        assert!(warnings[0].to_string().contains("missing"));
     }
 }

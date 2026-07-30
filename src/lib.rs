@@ -32,13 +32,18 @@ pub fn run() -> Result<ExitCode> {
 }
 
 fn run_cli(cli: Cli) -> Result<ExitCode> {
-    match cli.command {
+    let Cli {
+        target,
+        cwd,
+        command,
+    } = cli;
+    match command {
         Some(Command::Update) => update::run(),
         Some(Command::Snapshot) => snapshot(),
         command => {
             let config = ConfigDir::discover()?;
             match command {
-                None => select_and_open(&config),
+                None => select_and_open(&config, target.as_deref(), cwd.as_deref()),
                 Some(Command::Save { name, force }) => save(&config, &name, force),
                 Some(Command::Rm { name }) => remove(&config, &name),
                 Some(Command::Ls) => list(&config),
@@ -63,7 +68,11 @@ fn snapshot() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn select_and_open(config: &ConfigDir) -> Result<ExitCode> {
+fn select_and_open(
+    config: &ConfigDir,
+    target: Option<&str>,
+    cwd: Option<&std::path::Path>,
+) -> Result<ExitCode> {
     let names = config.list()?;
     if names.is_empty() {
         bail!("no projects found in {}", config.path().display());
@@ -71,7 +80,8 @@ fn select_and_open(config: &ConfigDir) -> Result<ExitCode> {
     let Some(name) = cli::select_with_fzf(&names)? else {
         return Ok(ExitCode::from(130));
     };
-    let document = config.load(&name)?;
+    let mut document = config.load(&name)?;
+    document.project.apply_launch_overrides(target, cwd)?;
     tmux::open(&document.project)?;
     Ok(ExitCode::SUCCESS)
 }

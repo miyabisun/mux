@@ -181,7 +181,7 @@ impl Tmux {
         Ok(Window {
             name,
             layout: Some(layout),
-            root: (window_root != *root).then_some(window_root),
+            root: snapshot_window_root(root, &window_root),
             focused_pane: Some(focused_pane),
             panes,
         })
@@ -215,7 +215,7 @@ impl Tmux {
     ) -> Result<()> {
         let first_window = &project.windows[0];
         let first_name = &first_window.name;
-        let first_root = first_window.root.as_deref().unwrap_or(&project.root);
+        let first_root = project.resolved_window_root(first_window)?;
         let arguments = [
             OsString::from("new-session"),
             OsString::from("-d"),
@@ -227,7 +227,7 @@ impl Tmux {
             OsString::from("-n"),
             OsString::from(first_name),
             OsString::from("-c"),
-            OsString::from(first_root),
+            OsString::from(first_root.as_os_str()),
         ];
         let session_id = self.single_output(arguments)?;
         *created_session = Some(session_id.clone());
@@ -239,11 +239,11 @@ impl Tmux {
             OsString::from("-F"),
             OsString::from("#{window_id}"),
         ])?;
-        let mut windows = vec![self.populate_window(&first_id, first_window, first_root)?];
+        let mut windows = vec![self.populate_window(&first_id, first_window, &first_root)?];
 
         for window in project.windows.iter().skip(1) {
             let name = &window.name;
-            let root = window.root.as_deref().unwrap_or(&project.root);
+            let root = project.resolved_window_root(window)?;
             let arguments = [
                 OsString::from("new-window"),
                 OsString::from("-d"),
@@ -255,10 +255,10 @@ impl Tmux {
                 OsString::from("-n"),
                 OsString::from(name),
                 OsString::from("-c"),
-                OsString::from(root),
+                OsString::from(root.as_os_str()),
             ];
             let id = self.single_output(arguments)?;
-            windows.push(self.populate_window(&id, window, root)?);
+            windows.push(self.populate_window(&id, window, &root)?);
         }
 
         let startup_window_name = project
@@ -286,7 +286,7 @@ impl Tmux {
         &self,
         window_id: &str,
         window: &Window,
-        root: &str,
+        root: &Path,
     ) -> Result<CreatedWindow> {
         let mut pane_ids = vec![self.single_output([
             OsString::from("list-panes"),
@@ -306,7 +306,7 @@ impl Tmux {
                 OsString::from("-t"),
                 OsString::from(window_id),
                 OsString::from("-c"),
-                OsString::from(root),
+                OsString::from(root.as_os_str()),
             ];
             let pane_id = self.single_output(arguments)?;
             self.send_command(&pane_id, command)?;
@@ -469,6 +469,20 @@ impl Tmux {
     }
 }
 
+fn snapshot_window_root(project_root: &str, window_root: &str) -> Option<String> {
+    if window_root == project_root {
+        return None;
+    }
+    Path::new(window_root)
+        .strip_prefix(project_root)
+        .ok()
+        .filter(|root| !root.as_os_str().is_empty())
+        .map_or_else(
+            || Some(window_root.to_owned()),
+            |root| Some(root.to_string_lossy().into_owned()),
+        )
+}
+
 fn normalize_project_name(name: &str) -> Result<String> {
     let mut normalized = String::new();
     let mut replacing = false;
@@ -583,6 +597,19 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_window_roots_are_portable_inside_the_project() {
+        assert_eq!(snapshot_window_root("/work/app", "/work/app"), None);
+        assert_eq!(
+            snapshot_window_root("/work/app", "/work/app/src/api"),
+            Some("src/api".to_owned())
+        );
+        assert_eq!(
+            snapshot_window_root("/work/app", "/work/other"),
+            Some("/work/other".to_owned())
+        );
+    }
+
+    #[test]
     #[ignore = "requires a real tmux binary"]
     fn real_tmux_session_is_built_without_user_configuration() {
         let temp = tempfile::tempdir().unwrap();
@@ -604,7 +631,7 @@ mod tests {
             "name = \"mux-e2e\"\nroot = \"{}\"\nstartup_window = \"agent\"\nstartup_pane = 2\n\n[[windows]]\nname = \"agent\"\nlayout = \"{checksum:04x},{layout_body}\"\nfocused_pane = 1\npanes = [\"printf ok > {}\", \"\"]\n\n[[windows]]\nname = \"editor\"\nroot = \"{}\"\nfocused_pane = 2\npanes = [\"\", \"\"]\n",
             root.display(),
             marker.display(),
-            editor_root.display()
+            "editor"
         );
         let project = ProjectDocument::parse(&source).unwrap().project;
         let client = Tmux {

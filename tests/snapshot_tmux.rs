@@ -2,6 +2,7 @@ use std::{
     ffi::OsStr,
     fs,
     io::Write,
+    os::unix::fs::PermissionsExt,
     path::Path,
     process::{Command, Output, Stdio},
     thread,
@@ -202,7 +203,7 @@ fn assert_snapshot(source: &str, stderr: &[u8], roots: [&Path; 3], first_layout:
     );
     assert!(windows[0].get("root").is_none());
     assert_eq!(windows[1]["name"].as_str(), Some("same-2"));
-    assert_eq!(windows[1]["root"].as_str(), roots[1].to_str());
+    assert_eq!(windows[1]["root"].as_str(), Some("other"));
     let warnings = String::from_utf8_lossy(stderr);
     assert!(warnings.contains("keep names unique"), "{warnings}");
     assert!(warnings.contains("cwd differs"), "{warnings}");
@@ -238,12 +239,103 @@ fn save_and_check(source: &str, config: &Path) {
     );
 }
 
+fn launch_saved_snapshot(server: &TmuxServer, temp: &Path, config: &Path, roots: [&Path; 2]) {
+    let bin = temp.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let fzf = bin.join("fzf");
+    fs::write(
+        &fzf,
+        "#!/bin/sh\nwhile IFS= read -r _line; do :; done\nprintf 'captured\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fzf, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let real_tmux = Command::new("sh")
+        .args(["-c", "command -v tmux"])
+        .output()
+        .unwrap();
+    assert!(real_tmux.status.success());
+    let real_tmux = String::from_utf8(real_tmux.stdout).unwrap();
+    let tmux = bin.join("tmux");
+    fs::write(
+        &tmux,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = attach-session ]; then exit 0; fi\nexec '{}' -L '{}' -f /dev/null \"$@\"\n",
+            real_tmux.trim(),
+            server.socket
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let launched = Command::new(env!("CARGO_BIN_EXE_mux"))
+        .args(["-t", "roundtrip"])
+        .env("MUX_CONFIG", config)
+        .env("PATH", &bin)
+        .env_remove("TMUX")
+        .output()
+        .unwrap();
+    assert!(
+        launched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&launched.stderr)
+    );
+
+    for (window, expected) in [("same", roots[0]), ("same-2", roots[1])] {
+        let paths = server.success([
+            "list-panes",
+            "-t",
+            &format!("=roundtrip:{window}"),
+            "-F",
+            "#{pane_current_path}",
+        ]);
+        assert!(
+            paths.lines().all(|path| path == expected.to_string_lossy()),
+            "{paths}"
+        );
+    }
+
+    let replacement = temp.join("replacement");
+    let replacement_other = replacement.join("other");
+    fs::create_dir(&replacement).unwrap();
+    fs::create_dir(&replacement_other).unwrap();
+    let overridden = Command::new(env!("CARGO_BIN_EXE_mux"))
+        .args(["-t", "cwd-override", "-c"])
+        .arg(&replacement)
+        .env("MUX_CONFIG", config)
+        .env("PATH", &bin)
+        .env_remove("TMUX")
+        .output()
+        .unwrap();
+    assert!(
+        overridden.status.success(),
+        "{}",
+        String::from_utf8_lossy(&overridden.stderr)
+    );
+    for (window, expected) in [
+        ("same", replacement.as_path()),
+        ("same-2", replacement_other.as_path()),
+    ] {
+        let paths = server.success([
+            "list-panes",
+            "-t",
+            &format!("=cwd-override:{window}"),
+            "-F",
+            "#{pane_current_path}",
+        ]);
+        assert!(
+            paths.lines().all(|path| path == expected.to_string_lossy()),
+            "{paths}"
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires a real tmux binary"]
 fn snapshot_round_trips_through_the_real_tmux_socket() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("root");
-    let other = temp.path().join("other");
+    let other = root.join("other");
     let different = temp.path().join("different");
     for path in [&root, &other, &different] {
         fs::create_dir(path).unwrap();
@@ -272,5 +364,7 @@ fn snapshot_round_trips_through_the_real_tmux_socket() {
     );
     let source = String::from_utf8(snapshot.stdout).unwrap();
     assert_snapshot(&source, &snapshot.stderr, roots, &evidence.first_layout);
-    save_and_check(&source, &temp.path().join("config"));
+    let config = temp.path().join("config");
+    save_and_check(&source, &config);
+    launch_saved_snapshot(&server, temp.path(), &config, [&root, &other]);
 }
